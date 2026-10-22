@@ -5,6 +5,24 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-22
+
+### Changed
+- **Breaking (output semantics):** with `EVAL_ON_TEST`, each fold's best
+  checkpoint is now evaluated on **both** val and test. `predictions.csv` and
+  the fold metrics are always val (previously they held test results when
+  `EVAL_ON_TEST` was on), and the test results go to `test_predictions.csv`
+  plus a `"test"` block (mean/std AUC, per-fold metrics) in `summary.json`.
+
+### Added
+- `SPLIT_SEED` config key (optional, defaults to `RANDOM_SEED`): seeds the
+  train/val/test split separately, so seed repeats keep the same folds and test set
+- `WARMUP_EPOCHS` config key (optional, default 0): linear LR warmup (1% → 100%)
+  before the configured schedule
+- `TorchExperiment.check_split` hook, called before each fold trains (e.g. to
+  verify the test split against a frozen list)
+- `evaluate.save_predictions_csv`
+
 ### Fixed
 - README's "Quick example" now matches `TorchExperiment`'s real API
 - `pyproject.toml` gained `readme`/`license`/`classifiers`/`authors`/

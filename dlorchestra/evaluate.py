@@ -156,6 +156,20 @@ def plot_roc_curve(
 # Per-fold artifact saving
 # ---------------------------------------------------------------------------
 
+def save_predictions_csv(detailed_results: list[dict], path: Path) -> None:
+    """Write per-sample predictions: image, true_label, prediction, prob."""
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["image", "true_label", "prediction", "prob"])
+        writer.writeheader()
+        for r in detailed_results:
+            writer.writerow({
+                "image": r["image"],
+                "true_label": r["true_label"],
+                "prediction": r["pred_label"],
+                "prob": f"{r['prob']:.6f}",
+            })
+
+
 def save_fold_artifacts(
     detailed_results: list[dict],
     metrics_history: list[dict],
@@ -183,18 +197,7 @@ def save_fold_artifacts(
     preds = [r["pred_label"] for r in detailed_results]
     probs = [r["prob"] for r in detailed_results]
 
-    # -- predictions.csv --
-    pred_path = fold_dir / "predictions.csv"
-    with open(pred_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["image", "true_label", "prediction", "prob"])
-        writer.writeheader()
-        for r in detailed_results:
-            writer.writerow({
-                "image": r["image"],
-                "true_label": r["true_label"],
-                "prediction": r["pred_label"],
-                "prob": f"{r['prob']:.6f}",
-            })
+    save_predictions_csv(detailed_results, fold_dir / "predictions.csv")
 
     # -- metrics.csv (per-epoch + final_eval row) --
     metrics_path = fold_dir / "metrics.csv"
@@ -280,14 +283,21 @@ def save_evaluation_summary(
     logger.info("Evaluation summary saved to %s", output_path)
 
 
+def _round_metrics(m: MetricsDict) -> dict:
+    return {k: round(v, 4) if not np.isnan(v) else None for k, v in m.items()}
+
+
 def save_summary_json(
     all_fold_metrics: dict[str, MetricsDict],
     output_path: Path,
+    test_fold_metrics: dict[str, MetricsDict] | None = None,
 ) -> None:
     """Write summary.json — the experiment completion marker.
 
-    Contains mean/std AUC, best fold, and per-fold metric snapshots.
-    Written LAST so its presence signals a fully completed experiment.
+    Contains mean/std val AUC, best fold, and per-fold metric snapshots;
+    with test_fold_metrics, also a "test" block (each fold's model scored on
+    the same held-out test set). Written LAST so its presence signals a fully
+    completed experiment.
     """
     auc_vals = [m.get("AUC", float("nan")) for m in all_fold_metrics.values()]
     valid_aucs = [v for v in auc_vals if not np.isnan(v)]
@@ -306,11 +316,16 @@ def save_summary_json(
         "best_fold": best_fold,
         "best_fold_auc": best_auc if best_fold else None,
         "num_folds": len(all_fold_metrics),
-        "per_fold": {
-            name: {k: round(v, 4) if not np.isnan(v) else None for k, v in m.items()}
-            for name, m in all_fold_metrics.items()
-        },
+        "per_fold": {name: _round_metrics(m) for name, m in all_fold_metrics.items()},
     }
+    if test_fold_metrics:
+        test_aucs = [m.get("AUC", float("nan")) for m in test_fold_metrics.values()]
+        test_aucs = [v for v in test_aucs if not np.isnan(v)]
+        summary["test"] = {
+            "mean_auc": float(np.mean(test_aucs)) if test_aucs else None,
+            "std_auc": float(np.std(test_aucs)) if test_aucs else None,
+            "per_fold": {name: _round_metrics(m) for name, m in test_fold_metrics.items()},
+        }
 
     with open(output_path, "w") as f:
         json.dump(summary, f, indent=2)

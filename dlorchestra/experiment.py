@@ -14,8 +14,9 @@ non-PyTorch tools lives in :mod:`dlorchestra.subprocess_experiment`.
     ├── set_seed
     ├── get_data_list → (optional external-data split) → split_data
     └── for each fold:
-          build_dataloaders → build_model → run_training_loop
-          → validate (eval set) → save_fold_artifacts
+          check_split → build_dataloaders → build_model → run_training_loop
+          → validate (val set) → save_fold_artifacts
+          → (EVAL_ON_TEST) validate (test set) → test_predictions.csv
         → save_evaluation_summary
         → save_summary_json  (completion marker, written last)
 
@@ -95,6 +96,12 @@ class TorchExperiment(BaseExperiment):
         get_head_param_ids(model, config) -> set[int] | None
         get_stratify_group_fn(config) -> Callable[[dict], str] | None
         log_extra_fold_info(train_files, val_files, test_files, config) -> None
+        check_split(fold_idx, train_files, val_files, test_files, config) -> None
+
+    Config keys read here (besides the training ones): ``RANDOM_SEED``,
+    optional ``SPLIT_SEED`` (defaults to ``RANDOM_SEED``; set it to vary
+    init/augmentation while keeping folds and the test set fixed),
+    ``EVAL_ON_TEST``.
     """
 
     def __init__(self, experiments_dir: Path, device: str = "cuda"):
@@ -132,6 +139,13 @@ class TorchExperiment(BaseExperiment):
         self, train_files: list[dict], val_files: list[dict], test_files: list[dict], config: dict,
     ) -> None:
         pass
+
+    def check_split(
+        self, fold_idx: int, train_files: list[dict], val_files: list[dict],
+        test_files: list[dict], config: dict,
+    ) -> None:
+        """Called before each fold trains. Raise to abort the experiment,
+        e.g. when the test set differs from a frozen list."""
 
     def split_external_data(
         self, all_data: list[dict], config: dict,
@@ -210,12 +224,17 @@ class TorchExperiment(BaseExperiment):
 
         all_data, external_data = self.split_external_data(all_data, config)
 
+        split_seed = config.get("SPLIT_SEED")
+        split_seed = seed if split_seed is None else split_seed
+        if split_seed != seed:
+            logger.info("Split seed %d (training seed %d)", split_seed, seed)
+
         group_fn = self.get_stratify_group_fn(config)
         fold_splits = splitting.split_data(
             all_data,
             n_splits=config["N_SPLITS"],
             test_size=config["TEST_SPLIT_RATIO"],
-            seed=seed,
+            seed=split_seed,
             use_kfold=config["USE_KFOLD"],
             val_split_ratio=config["VAL_SPLIT_RATIO"],
             group_fn=group_fn,
@@ -223,8 +242,10 @@ class TorchExperiment(BaseExperiment):
 
         device = self.device
         all_fold_metrics: dict[str, MetricsDict] = {}
+        all_test_metrics: dict[str, MetricsDict] = {}
 
         for fold_idx, train_files, val_files, test_files in fold_splits:
+            self.check_split(fold_idx, train_files, val_files, test_files, config)
             result = self._run_fold(
                 fold_idx, train_files, val_files, test_files,
                 name=name, experiment_dir=experiment_dir, config=config, device=device,
@@ -232,8 +253,10 @@ class TorchExperiment(BaseExperiment):
             )
             if result is None:  # epoch timeout — abort the whole experiment
                 return
-            fold_name, fold_metrics = result
+            fold_name, fold_metrics, test_metrics = result
             all_fold_metrics[fold_name] = fold_metrics
+            if test_metrics is not None:
+                all_test_metrics[fold_name] = test_metrics
 
         evaluate.save_evaluation_summary(
             all_fold_metrics,
@@ -242,6 +265,7 @@ class TorchExperiment(BaseExperiment):
         evaluate.save_summary_json(
             all_fold_metrics,
             experiment_dir / "summary.json",
+            test_fold_metrics=all_test_metrics or None,
         )
 
         logger.info("Experiment '%s' complete", name)
@@ -259,11 +283,16 @@ class TorchExperiment(BaseExperiment):
         device: str,
         external_data: list[dict],
         group_fn: Callable[[dict], str] | None,
-    ) -> tuple[str, MetricsDict] | None:
+    ) -> tuple[str, MetricsDict, MetricsDict | None] | None:
         """Run one fold end-to-end: dataloaders, model, training, eval, artifacts.
 
-        Returns (fold_name, fold_metrics), or None if the fold hit its epoch
-        timeout — the caller should then abort the whole experiment.
+        The best checkpoint is always evaluated on val (predictions.csv, fold
+        metrics). With EVAL_ON_TEST it is also evaluated on the held-out test
+        set (test_predictions.csv, test metrics).
+
+        Returns (fold_name, val_metrics, test_metrics or None), or None if the
+        fold hit its epoch timeout — the caller should then abort the whole
+        experiment.
         """
         fold_num = fold_idx + 1
         fold_name = f"fold_{fold_num}"
@@ -325,29 +354,36 @@ class TorchExperiment(BaseExperiment):
 
         logger.info("%s %s training complete (%.1f min)", name, fold_name, train_minutes)
 
-        eval_loader = test_loader if eval_on_test else val_loader
         criterion = torch.nn.CrossEntropyLoss()
         amp_dtype = training.resolve_amp_dtype(config)
-        result = training.validate_one_epoch(
-            model, eval_loader, criterion, device,
-            use_amp=config["USE_AMP"], amp_dtype=amp_dtype, return_details=True,
-        )
-        eval_loss, eval_acc, eval_f2, eval_auc, detailed_results = result
 
-        logger.info(
-            "%s %s eval — loss=%.4f  acc=%.4f  AUC=%.4f  F2=%.4f",
-            name, fold_name, eval_loss, eval_acc, eval_auc, eval_f2,
-        )
+        def evaluate_on(loader, split_name):
+            result = training.validate_one_epoch(
+                model, loader, criterion, device,
+                use_amp=config["USE_AMP"], amp_dtype=amp_dtype, return_details=True,
+            )
+            loss, acc, f2, auc, details = result
+            logger.info(
+                "%s %s %s eval — loss=%.4f  acc=%.4f  AUC=%.4f  F2=%.4f",
+                name, fold_name, split_name, loss, acc, auc, f2,
+            )
+            return details
 
+        val_details = evaluate_on(val_loader, "val")
         evaluate.save_fold_artifacts(
-            detailed_results, metrics_history, best_checkpoint,
+            val_details, metrics_history, best_checkpoint,
             fold_dir, config["CLASSES"],
         )
+        fold_metrics = evaluate.calculate_fold_metrics(val_details)
 
-        fold_metrics = evaluate.calculate_fold_metrics(detailed_results)
+        test_metrics = None
+        if eval_on_test:
+            test_details = evaluate_on(test_loader, "test")
+            evaluate.save_predictions_csv(test_details, fold_dir / "test_predictions.csv")
+            test_metrics = evaluate.calculate_fold_metrics(test_details)
 
         del model, optimizer, scheduler
         del train_loader, val_loader, test_loader
         torch.cuda.empty_cache()
 
-        return fold_name, fold_metrics
+        return fold_name, fold_metrics, test_metrics

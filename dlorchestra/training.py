@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import fbeta_score, roc_auc_score
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
 
 logger = logging.getLogger(__name__)
 
@@ -61,18 +61,32 @@ def build_optimizer(model: nn.Module, config: dict) -> torch.optim.Optimizer:
 
 
 def build_scheduler(optimizer: torch.optim.Optimizer, config: dict):
-    """Returns a scheduler or None if disabled."""
+    """Returns a per-epoch scheduler, or None if disabled.
+
+    Optional ``WARMUP_EPOCHS`` (default 0) ramps the LR linearly from 1% to
+    100% over that many epochs before the configured schedule starts
+    (with LR_SCHEDULER "none", the LR then stays constant).
+    """
     name = config["LR_SCHEDULER"].lower()
     if name == "none":
-        return None
-    if name == "cosine":
-        return CosineAnnealingWarmRestarts(
+        main = None
+    elif name == "cosine":
+        main = CosineAnnealingWarmRestarts(
             optimizer,
             T_0=config["COSINE_T0"],
             T_mult=config["COSINE_T_MULT"],
             eta_min=config["COSINE_ETA_MIN"],
         )
-    raise ValueError(f"Unknown LR_SCHEDULER: '{config['LR_SCHEDULER']}'")
+    else:
+        raise ValueError(f"Unknown LR_SCHEDULER: '{config['LR_SCHEDULER']}'")
+
+    warmup = config.get("WARMUP_EPOCHS", 0)
+    if not warmup:
+        return main
+    ramp = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup)
+    if main is None:
+        return ramp
+    return SequentialLR(optimizer, [ramp, main], milestones=[warmup])
 
 
 def resolve_amp_dtype(config: dict) -> torch.dtype:
