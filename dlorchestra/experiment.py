@@ -31,7 +31,7 @@ import sys
 import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 import torch
 
@@ -96,6 +96,7 @@ class TorchExperiment(BaseExperiment):
         get_head_param_ids(model, config) -> set[int] | None
         get_stratify_group_fn(config) -> Callable[[dict], str] | None
         log_extra_fold_info(train_files, val_files, test_files, config) -> None
+        split_data(all_data, config, seed, group_fn) -> iterator of folds
         check_split(fold_idx, train_files, val_files, test_files, config) -> None
 
     Config keys read here (besides the training ones): ``RANDOM_SEED``,
@@ -139,6 +140,23 @@ class TorchExperiment(BaseExperiment):
         self, train_files: list[dict], val_files: list[dict], test_files: list[dict], config: dict,
     ) -> None:
         pass
+
+    def split_data(
+        self, all_data: list[dict], config: dict, seed: int,
+        group_fn: Callable[[dict], str] | None,
+    ) -> Iterator[tuple[int, list[dict], list[dict], list[dict]]]:
+        """Yield (fold_idx, train_files, val_files, test_files). Default:
+        :func:`dlorchestra.splitting.split_data`. Override for e.g. a frozen
+        test list or patient-grouped folds."""
+        return splitting.split_data(
+            all_data,
+            n_splits=config["N_SPLITS"],
+            test_size=config["TEST_SPLIT_RATIO"],
+            seed=seed,
+            use_kfold=config["USE_KFOLD"],
+            val_split_ratio=config["VAL_SPLIT_RATIO"],
+            group_fn=group_fn,
+        )
 
     def check_split(
         self, fold_idx: int, train_files: list[dict], val_files: list[dict],
@@ -230,15 +248,7 @@ class TorchExperiment(BaseExperiment):
             logger.info("Split seed %d (training seed %d)", split_seed, seed)
 
         group_fn = self.get_stratify_group_fn(config)
-        fold_splits = splitting.split_data(
-            all_data,
-            n_splits=config["N_SPLITS"],
-            test_size=config["TEST_SPLIT_RATIO"],
-            seed=split_seed,
-            use_kfold=config["USE_KFOLD"],
-            val_split_ratio=config["VAL_SPLIT_RATIO"],
-            group_fn=group_fn,
-        )
+        fold_splits = self.split_data(all_data, config, split_seed, group_fn)
 
         device = self.device
         all_fold_metrics: dict[str, MetricsDict] = {}

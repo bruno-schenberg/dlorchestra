@@ -5,6 +5,13 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-04
+
+### Added
+- `TorchExperiment.split_data(all_data, config, seed, group_fn)` hook: override
+  to replace the default stratified split (e.g. a frozen test list, or
+  patient-grouped folds). The default calls `splitting.split_data` as before.
+
 ## [0.2.0] - 2026-10-22
 
 ### Changed
