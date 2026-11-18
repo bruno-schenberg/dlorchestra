@@ -1,5 +1,7 @@
 # dlorchestra
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24350841.svg)](https://doi.org/10.5281/zenodo.24350841)
+
 DL experiment orchestration library. Manages the boilerplate around training deep learning models so you can focus on the model and data.
 
 **Orchestration only** — does not ship model architectures or task-specific training loops. You bring your own `nn.Module` and dataloaders; dlorchestra handles everything else.
